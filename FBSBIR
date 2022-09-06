@@ -1,0 +1,374 @@
+import os
+import torch
+import time
+import torchvision.transforms as T
+import matplotlib.pyplot as plt
+import torchvision
+import numpy as np
+import torch.nn.functional as F
+import torch.nn as nn
+from torch.nn import Module
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+from random import randint
+from datetime import datetime
+from SBIR_option import hp
+from torchvision import transforms
+from skimage import feature
+import cv2
+
+def edge_detector(path):
+    input_image = cv2.imread(path)
+    gray = cv2.cvtColor(input_image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, threshold1=30, threshold2=100)
+    x =  255 - edges[0:, :]
+    img = Image.fromarray(x).convert('RGB')
+    return img
+
+class LoadFromFolder(Dataset):
+    def __init__(self, hp, mode, transform):
+        # Set the loading directory
+        self.hp = hp
+        self.sketch_dir = hp.sketch_dir
+        self.image_dir = hp.image_dir
+        self.mode = mode
+        self.transform = transform
+        self.sketch_train_list = os.listdir( self.sketch_dir + 'train')
+        self.sketch_test_list = os.listdir(self.sketch_dir + 'test')
+
+    def __len__(self):
+        if self.mode == 'Train':
+            return len(self.sketch_train_list)
+        elif self.mode == 'Test':
+            return len(self.sketch_test_list)
+
+    def __getitem__(self, idx):
+        if self.mode == 'Train':
+            sketch_path = os.path.join(self.sketch_dir, 'train', self.sketch_train_list[idx])
+            image = Image.open(sketch_path).convert('RGB')
+            anc_train = self.transform(image)
+
+            positive_sample = '_'.join(self.sketch_train_list[idx].split('/')[-1].split('_')[:-1])
+            positive_path = os.path.join(self.image_dir,'train/', positive_sample + '.png')
+            input_image = edge_detector(positive_path)
+            pos_train = self.transform(input_image)
+
+            possible_list = list(range(len(self.sketch_train_list)))
+            possible_list.remove(idx)
+                
+            negative_item = possible_list[randint(0, len(possible_list) - 1)]
+            negative_sample = '_'.join(self.sketch_train_list[negative_item].split('/')[-1].split('_')[:-1])
+            negative_path = os.path.join(self.image_dir,'train/', negative_sample + '.png')
+            neg_image = edge_detector(negative_path)
+            neg_train = self.transform(neg_image)
+            #print("neg_image", negative_img)
+                
+            sample = { 'sketch_img': anc_train, 'sketch_path':sketch_path,
+                        'positive_img': pos_train, 'positive_path': positive_path,
+                        'negative_img':neg_train } 
+        
+        elif self.mode == 'Test':
+            sketch_path = os.path.join(self.sketch_dir, 'test', self.sketch_test_list[idx])
+            image = Image.open(sketch_path).convert('RGB')
+            anc_test = self.transform(image)
+
+            positive_sample = '_'.join(self.sketch_test_list[idx].split('/')[-1].split('_')[:-1])
+            positive_path = os.path.join(self.image_dir,'test/', positive_sample + '.png')
+            input_image = edge_detector(positive_path)
+            pos_test = self.transform(input_image)
+
+            possible_list = list(range(len(self.sketch_test_list)))
+            possible_list.remove(idx)
+            
+            negative_item = possible_list[randint(0, len(possible_list) - 1)]
+            negative_sample = '_'.join(self.sketch_test_list[negative_item].split('/')[-1].split('_')[:-1])
+            negative_path = os.path.join(self.image_dir, 'test/', negative_sample + '.png')
+            neg_image = edge_detector(negative_path)
+            neg_test = self.transform(neg_image)
+            #print("neg_image", negative_img)
+
+            sample = { 'sketch_img': anc_test, 'sketch_path':sketch_path,
+                        'positive_img': pos_test, 'positive_path': positive_path,
+                        'negative_img':neg_test}  
+             
+
+        return sample
+
+if __name__ == '__main__':    
+    train_dataset = LoadFromFolder(hp, mode = 'Train', transform = T.Compose([T.ToTensor(),
+                                                            T.Resize(225), 
+                                                            T.RandomHorizontalFlip(p=0.5),
+                                                            T.Normalize(mean=[0.485, 0.456, 0.406], 
+                                                                    std=[0.229, 0.224, 0.225])])) 
+
+
+    test_dataset = LoadFromFolder(hp, mode = 'Test', transform =T.Compose([T.ToTensor(),
+                                                    T.Resize(225), 
+                                                    T.Normalize(mean=[0.485, 0.456, 0.406], 
+                                                                std=[0.229, 0.224, 0.225])])) 
+
+    train_dataloader = DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=4)
+    test_dataloader  = DataLoader(test_dataset, batch_size=128, shuffle=False, num_workers=4)
+    print(f'train set: {len(train_dataloader.dataset)}')
+    print(f'val set: {len(test_dataloader.dataset)}')
+
+    nsamples = 5
+    for i, batch_t in enumerate(train_dataloader):
+        if i < nsamples:
+            print(batch_t['sketch_img'].shape)
+            plt.subplot(131)
+            simg = batch_t['sketch_img'][0].numpy()
+            plt.imshow(np.transpose(simg, (1, 2, 0)),interpolation='nearest')
+            plt.subplot(132)
+            pimg = batch_t['positive_img'][0].numpy()
+            plt.imshow(np.transpose(pimg, (1, 2, 0)), interpolation='nearest')
+            plt.subplot(133)
+            pimg = batch_t['negative_img'][0].numpy()
+            plt.imshow(np.transpose(pimg, (1, 2, 0)), interpolation='nearest')
+            plt.show()
+
+
+class SketchTriplet_Network(nn.Module):
+    def __init__(self, num_feat=512):
+        super(SketchTriplet_Network, self).__init__()
+        self.num_feat = num_feat
+        #-------------------------------------
+        self.conv1_a = nn.Sequential(
+            nn.Conv2d(in_channels=3,out_channels=64,kernel_size=15,stride=3,padding=0),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=3,stride=2))
+        self.conv2_a = nn.Sequential(
+            nn.Conv2d(in_channels=64,out_channels=128,kernel_size=5,stride=1,padding=0),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=3,stride=2))
+        self.conv3_a = nn.Sequential(
+            nn.Conv2d(in_channels=128,out_channels=256,kernel_size=3,stride=1,padding=1),
+            nn.ReLU()
+        )
+        self.conv4_a = nn.Sequential(
+            nn.Conv2d(in_channels=256,out_channels=256,kernel_size=3,stride=1,padding=1),
+            nn.ReLU()
+        )
+        self.conv5_a = nn.Sequential(
+            nn.Conv2d(in_channels=256,out_channels=256,kernel_size=3,stride=1,padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=3,stride=2)
+        )
+        self.fc6_a = nn.Sequential(
+            nn.Linear(256 * 10 * 10, 2048),
+            nn.ReLU(),
+            nn.Dropout(p=0.55)
+        )
+        self.fc7_a = nn.Sequential(
+            nn.Linear(2048, 512),
+            nn.ReLU(),
+            nn.Dropout(p=0.55)
+        )
+        self.feat_a = nn.Linear(512, 512)
+
+    def forward(self, x):
+        x = self.conv1_a(x)
+        x = self.conv2_a(x)
+        x = self.conv3_a(x)
+        x = self.conv4_a(x)
+        x = self.conv5_a(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc6_a(x)
+        x = self.fc7_a(x)
+        x = self.feat_a(x)
+        x = F.normalize(x)
+        return x
+
+class Resnet50_Network(nn.Module):
+    def __init__(self, hp):
+        super(Resnet50_Network, self).__init__()
+        backbone = backbone_.resnet50(pretrained=True) #resnet50, resnet18, resnet34
+        
+        self.features = nn.Sequential()
+        for name, module in backbone.named_children():
+            if name not in ['avgpool', 'fc']:
+                self.features.add_module(name, module)
+        self.pool_method =  nn.AdaptiveMaxPool2d(1)
+        self.linear = nn.Linear(2048, 512)
+    
+    def forward(self, input, bb_box = None):
+        x = self.features(input)
+        x = self.pool_method(x).view(-1, 2048)
+        x = self.linear(x)
+        #x = torch.flatten(x, 1)
+        return F.normalize(x)
+
+class Resnet34_Network(nn.Module):
+    def __init__(self, hp):
+        super(Resnet34_Network, self).__init__()
+        backbone = backbone_.resnet34(pretrained=True) #resnet50, resnet18, resnet34
+        
+        self.features = nn.Sequential()
+        for name, module in backbone.named_children():
+            if name not in ['avgpool', 'fc']:
+                self.features.add_module(name, module)
+        self.pool_method =  nn.AdaptiveMaxPool2d(1)
+        self.linear = nn.Linear(2048, 512)
+    
+    def forward(self, input, bb_box = None):
+        x = self.features(input)
+        x = self.pool_method(x).view(-1, 2048)
+        x = self.linear(x)
+        #x = torch.flatten(x, 1)
+        return F.normalize(x)
+
+class VGG_Network(nn.Module):
+    def __init__(self, hp):
+        super(VGG_Network, self).__init__()
+        self.backbone = backbone_.vgg16(pretrained=True).features
+        self.pool_method =  nn.AdaptiveMaxPool2d(1)
+
+    def forward(self, input, bb_box = None):
+        x = self.backbone(input)
+        x = self.pool_method(x).view(-1, 512)
+        return F.normalize(x)
+        
+        
+class FGSBIR_Model(nn.Module):
+    def __init__(self, hp):
+        super(FGSBIR_Model, self).__init__()
+        self.sample_embedding_network = eval(hp.backbone_name + '_Network(hp)')
+        self.loss = nn.TripletMarginLoss(margin=0.2)
+        self.sample_train_params = self.sample_embedding_network.parameters()
+        self.optimizer = optim.Adam(self.sample_train_params, hp.learning_rate)
+        self.hp = hp
+
+
+    def train_model(self, batch):
+        self.train()
+        self.optimizer.zero_grad()
+
+        positive_feature = self.sample_embedding_network(batch['positive_img'].to(device))
+        negative_feature = self.sample_embedding_network(batch['negative_img'].to(device))
+        sample_feature = self.sample_embedding_network(batch['sketch_img'].to(device))
+
+        loss = self.loss(sample_feature, positive_feature, negative_feature)
+        loss.backward()
+        self.optimizer.step()
+
+        return loss.item(), self.optimizer, 
+
+    def evaluate(self, datloader_Test):
+        Image_Feature_ALL = []
+        Image_Name = []
+        Sketch_Feature_ALL = []
+        Sketch_Name = []
+        start_time = time.time()
+        self.eval()
+        for i_batch, sanpled_batch in enumerate(datloader_Test):
+            sketch_feature, positive_feature= self.test_forward(sanpled_batch)
+            Sketch_Feature_ALL.extend(sketch_feature)
+            Sketch_Name.extend(sanpled_batch['sketch_path'])
+
+            for i_num, positive_name in enumerate(sanpled_batch['positive_path']):
+                if positive_name not in Image_Name:
+                    Image_Name.append(sanpled_batch['positive_path'][i_num])
+                    Image_Feature_ALL.append(positive_feature[i_num])
+
+        rank = torch.zeros(len(Sketch_Name))
+        Image_Feature_ALL = torch.stack(Image_Feature_ALL)
+
+        for num, sketch_feature in enumerate(Sketch_Feature_ALL):
+            s_name = Sketch_Name[num]
+            sketch_query_name = '_'.join(s_name.split('/')[-1].split('_')[:-1])
+            position_query = Image_Name.index(sketch_query_name)
+
+            distance = F.pairwise_distance(sketch_feature.unsqueeze(0), Image_Feature_ALL)
+            target_distance = F.pairwise_distance(sketch_feature.unsqueeze(0),
+                                                  Image_Feature_ALL[position_query].unsqueeze(0))
+
+            rank[num] = distance.le(target_distance).sum()
+
+        top1 = rank.le(1).sum().numpy() / rank.shape[0]
+        top10 = rank.le(10).sum().numpy() / rank.shape[0]
+
+        print('Time to EValuate:{}'.format(time.time() - start_time))
+        return top1, top10
+
+    def test_forward(self, batch):            #  this is being called only during evaluation
+        sketch_feature = self.sample_embedding_network(batch['sketch_img'].to(device))
+        positive_feature = self.sample_embedding_network(batch['positive_img'].to(device))
+        return sketch_feature.cpu(), positive_feature.cpu()
+
+def save_model(i_epoch, model, optimizer, top1_eval, top10_eval ):
+    """
+    Function to save the trained model to disk.
+    """
+    print(f"Saving final model...")
+    torch.save({
+                'epoch': i_epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'Top1_Acc': top1_eval,
+                'Top10_Acc': top10_eval
+                }, '/content/gdrive/MyDrive/Colab Notebooks/output/FGSBIR_final_model_new_VGG_1.pth')
+
+if __name__ == "__main__":
+    
+    parser = argparse.ArgumentParser(description='Fine-Grained SBIR Model')
+
+    parser.add_argument('--dataset_name', type=str, default='ShoeV2')
+    parser.add_argument('--backbone_name', type=str, default='VGG', help='VGG / SketchTriplet/InceptionV3/ Resnet50')
+    parser.add_argument('--pool_method', type=str, default='AdaptiveAvgPool2d',
+                        help='AdaptiveMaxPool2d / AdaptiveAvgPool2d / AvgPool2d')
+    #parser.add_argument('--root_dir', type=str, default='/vol/vssp/datasets/multiview/3VS/Vidyashree/SBIR')
+    #parser.add_argument('--out_dir', type=str, default='/mnt/fast/nobackup/users/ll00931/Vidya/Shoe2V_Dataset/SBIR')
+    parser.add_argument('--batchsize', type=int, default=32)
+    parser.add_argument('--nThreads', type=int, default=4)
+    parser.add_argument('--learning_rate', type=float, default=0.0001)
+    parser.add_argument('--max_epoch', type=int, default= 200)
+    parser.add_argument('--eval_freq_iter', type=int, default=100)
+    parser.add_argument('--print_freq_iter', type=int, default=10)
+    parser.add_argument('--out_dir', type=str, default='/content/gdrive/MyDrive/Colab Notebooks/output')
+
+    #hp = parser.parse_args()
+    hp, unknown = parser.parse_known_args()
+
+    dataloader_Train, dataloader_Test = get_dataloader(hp)
+    print(f'train set: {len(dataloader_Train.dataset)}')
+    print(f'val set: {len(dataloader_Test.dataset)}')
+    
+    """for i, batch_t in enumerate(dataloader_Train):
+        print(batch_t['sketch_img'].shape)"""
+    
+    
+    model = FGSBIR_Model(hp)
+    model.to(device)
+    # model.load_state_dict(torch.load('VGG_ShoeV2_model_best.pth', map_location=device))
+    log_dir = os.path.join(hp.out_dir + '/logs_SBIR_VGG-16' )
+    os.mkdir(log_dir) 
+    writer = tb.SummaryWriter()
+
+    step_count, top1, top10 = -1, 0, 0
+    for i_epoch in range(hp.max_epoch):
+        for batch_data in dataloader_Train:
+            step_count = step_count + 1
+            start = time.time()
+            model.train()
+            loss, optimize = model.train_model(batch=batch_data)
+
+            if step_count % hp.print_freq_iter == 0:
+                print('Epoch: {}, Iteration: {}, Loss: {:.5f}, Top1_Accuracy: {:.5f}, Top10_Accuracy: {:.5f}, Time: {}'.format
+                      (i_epoch, step_count, loss, top1, top10, time.time()-start))
+                writer.add_scalar('train-loss', loss, step_count)
+                
+            if step_count % hp.eval_freq_iter == 0:
+                with torch.no_grad():
+                    top1_eval, top10_eval = model.evaluate(dataloader_Test)
+                    print('results : ', top1_eval, ' / ', top10_eval)
+                    writer.add_scalar('Accuracy/Top1', top1,step_count)
+                    writer.add_scalar('Accuracy/Top10', top10,step_count)
+
+
+                if top1_eval > top1:
+                    torch.save(model.state_dict(), hp.backbone_name + '_' + hp.dataset_name + '_model_best_4_9.pth')
+                    save_model(i_epoch, model, optimize, top1_eval, top10_eval )
+                    top1, top10  = top1_eval, top10_eval
+                    print('Model Updated')
+
+    writer.close()
