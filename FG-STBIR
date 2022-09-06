@@ -1,0 +1,400 @@
+import os
+import glob
+import json
+from collections import Counter
+from nltk import word_tokenize
+import numpy as np
+from PIL import Image, ImageOps
+import torch
+import argparse
+from torchvision import transforms
+import torchvision.transforms as T
+from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+#device="cpu"
+import torchvision.models as backbone_
+from torchvision.models import VGG16_Weights
+from gensim.models.keyedvectors import KeyedVectors
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence 
+from torch.autograd import Variable
+import torch.nn as nn
+from torch import optim
+import time
+from pickletools import optimize
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#device="cpu"
+import torchvision.transforms as T
+from torch.utils import tensorboard as tb
+
+import argparse
+parser = argparse.ArgumentParser(description='Fine-Grained TBIR')
+
+parser.add_argument('--root_dir', type=str, default='/Users/nimavidu/Documents/Project/Dataset/sketch_photo_text/annotations/',
+    help='Enter root directory of Dataset')
+parser.add_argument('--backbone_name', type=str, default='Resnet34', help='VGG / SketchTriplet/InceptionV3/ Resnet50')
+parser.add_argument('--backbone_text', type=str, default='BiLSTM', help= 'SketchTriplet')
+parser.add_argument('-m','--main_dir', type=str, default='/Users/nimavidu/Desktop/sketches/')
+parser.add_argument('--word2vec',  default='/Users/nimavidu/gensim-data/word2vec-google-news-300/word2vec-google-news-300.gz', help='Enter word2vec pretrained model path')
+parser.add_argument('-pd','--photo_dir', type=str, default='/Users/nimavidu/Desktop/ShoeV2_photo')
+parser.add_argument('--out_dir', type=str, default='/content/gdrive/MyDrive/Colab Notebooks/output')
+parser.add_argument('-max_len', type=int, default=30)
+parser.add_argument('--batch_size', type=int, default=32)
+parser.add_argument('-lr','--learning_rate', type=float, default=0.0001)
+parser.add_argument('-me','--max_epoch', type=int, default=250)
+parser.add_argument('--eval_freq_iter', type=int, default=100)
+parser.add_argument('--print_freq_iter', type=int, default=10)
+parser.add_argument('--dataset_name', default = 'ShoeV2', help = 'Enter dataset name')
+#hp = parser.parse_args()
+hp, unknown = parser.parse_known_args()
+
+class TBIRDataset(torch.utils.data.Dataset):
+
+    def __init__(self, opt, mode='Train',
+            transform=None, max_len=50):
+        self.opt = opt
+        self.transform = transform
+        self.max_len = max_len
+        self.mode = mode
+
+        if mode == 'Train':
+            self.sketch_files = glob.glob('/content/gdrive/MyDrive/Colab Notebooks/sketch_photo_text/sketch/train/*.jpg')
+            self.all_image_files = glob.glob('/content/gdrive/MyDrive/Colab Notebooks/sketch_photo_text/photo/train/*.jpg')
+            word_corpus1 = json.load(open(os.path.join('/content/gdrive/MyDrive/Colab Notebooks/sketch_photo_text/annotations', 'shoes_2k_sketch_train.json')))
+        else:
+            self.sketch_files = glob.glob('/content/gdrive/MyDrive/Colab Notebooks/sketch_photo_text/sketch/test/*.jpg')
+            self.all_image_files = glob.glob('/content/gdrive/MyDrive/Colab Notebooks/sketch_photo_text/photo/test/*.jpg') 
+            word_corpus2 = json.load(open(os.path.join('/content/gdrive/MyDrive/Colab Notebooks/sketch_photo_text/annotations', 'shoes_2k_sketch_test.json')))
+
+        self.all_ids = [os.path.split(x)[-1][:-4] for x in self.all_image_files]
+
+       
+        self.word_ann = {}
+        for caption in word_corpus1['annotations']:
+            self.word_ann[caption['image_id']] = caption['caption']
+        for caption in word_corpus2['annotations']:
+            self.word_ann[caption['image_id']] = caption['caption']
+
+        word_map =[]
+        for sentences in word_corpus1['annotations']:
+            #print(sentences['caption'])
+            word_map.append(map(lambda x: x,sentences['caption'].split()))
+            #print(word_map)
+        for sentences in word_corpus1['annotations']:
+            #print(sentences['caption'])
+            word_map.append(map(lambda x: x,sentences['caption'].split()))
+            #print(word_map)
+
+        all_tokens = []
+        for tokens in word_map:
+            all_tokens.extend(tokens)
+        
+        token_freq = Counter(all_tokens)
+        self.word_map = {'<start>': 0, '<end>': 1, '<unk>': 2, '<pad>': 3}
+        count = 4
+        for (word, freq) in token_freq.items():
+            if freq >= 5:
+                self.word_map[word] = count
+                count += 1
+        print("length ", len(self.word_map.keys()))
+
+
+    def __len__(self):
+        return len(self.all_ids)
+
+    def __getitem__(self, index):
+        filename = self.all_ids[index]
+
+        local_state = np.random.RandomState()
+
+        if self.mode == 'Train':
+            sketch_file = os.path.join('/content/gdrive/MyDrive/Colab Notebooks/sketch_photo_text/sketch/train/', '%s_sketch.jpg'%filename)
+            image_file = os.path.join('/content/gdrive/MyDrive/Colab Notebooks/sketch_photo_text/photo/train/', '%s.jpg'%filename)
+            negative_shirtname  = local_state.choice(self.all_ids, 1)[0]
+            negative_file = os.path.join('/content/gdrive/MyDrive/Colab Notebooks/sketch_photo_text/photo/train/', '%s.jpg'%negative_shirtname)
+        else:
+            sketch_file = os.path.join('/content/gdrive/MyDrive/Colab Notebooks/sketch_photo_text/sketch/test/', '%s_sketch.jpg'%filename)
+            image_file = os.path.join('/content/gdrive/MyDrive/Colab Notebooks/sketch_photo_text/photo/test/', '%s.jpg'%filename)
+            negative_shirtname  = local_state.choice(self.all_ids, 1)[0]
+            negative_file = os.path.join('/content/gdrive/MyDrive/Colab Notebooks/sketch_photo_text/photo/test/', '%s.jpg'%negative_shirtname)
+
+        # captions from our dataset
+        text_data = word_tokenize(self.word_ann[int(filename)].lower())[:self.max_len]
+
+        sketch_data = Image.open(sketch_file).convert('RGB')
+        sketch_data = ImageOps.pad(sketch_data, size=(self.opt.max_len, self.opt.max_len))
+        
+        image_data = Image.open(image_file).convert('RGB')
+        negative_data = Image.open(negative_file).convert('RGB')
+
+        image_data = ImageOps.pad(image_data, size=(self.opt.max_len, self.opt.max_len))
+        negative_data = ImageOps.pad(negative_data, size=(self.opt.max_len, self.opt.max_len))
+
+        # encode caption
+        word_encode = [self.word_map['<start>']]
+        word_encode += [self.word_map.get(token, self.word_map['<unk>']) for token in text_data]
+        word_encode += [self.word_map['<end>']]
+
+        word_length = len(word_encode)
+        #print("word_length", word_length)
+
+        # pad the rest of encoded caption
+        word_encode += [self.word_map['<pad>']]*(max(0, self.max_len - len(word_encode)))
+
+        if self.transform:
+            txt_tensor = torch.tensor(word_encode)
+            anc_sketch = self.transform(sketch_data)
+            img_tensor = self.transform(image_data)
+            neg_tensor = self.transform(negative_data)
+        
+        #if self.return_orig:
+         #   return txt_tensor, word_length, img_tensor, neg_tensor, text_data, word_encode, image_data, negative_data
+        #else:
+        #sample = {'txt_tensor':txt_tensor, 'word_length': word_length, 'positive_img': img_tensor, 
+               #       'negative_img': neg_tensor}
+        return anc_sketch, txt_tensor, word_length, img_tensor, neg_tensor 
+
+def get_dataloader(hp):
+
+    dataset_Train  = TBIRDataset(hp, mode = 'Train', transform =transforms.Compose([T.ToTensor(),T.Resize(244), 
+                                                    T.Normalize(mean=[0.485, 0.456, 0.406], 
+                                                                std=[0.229, 0.224, 0.225])
+                                                                ]))
+    dataloader_Train = DataLoader(dataset_Train, batch_size=hp.batch_size, shuffle=True,
+                                        num_workers=4)
+    vocab_size = len(dataset_Train.word_map.items())
+
+    dataset_Test  = TBIRDataset(hp, mode = 'Test', transform =transforms.Compose([transforms.ToTensor(),T.Resize(244),
+                                                    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                                                   ]))
+    dataloader_Test = DataLoader(dataset_Test, batch_size=hp.batch_size, shuffle=False,
+                                   num_workers=4)
+    return dataloader_Train, dataloader_Test, vocab_size
+    
+    
+ class BiLSTM_Network(nn.Module):
+    def __init__(self, vocab_size, hidden_size=512, num_layers=2, output_dim = 512):
+        super(BiLSTM_Network, self).__init__()
+        self.model = KeyedVectors.load_word2vec_format('/content/gdrive/MyDrive/Colab Notebooks/gensim-data/word2vec-google-news-300/word2vec-google-news-300.gz', binary=True)
+        self.weights = torch.FloatTensor(self.model.vectors)
+        #self.hidden_size = hidden_size
+        #self.num_layers = num_layers
+        self.embeddings = nn.Embedding.from_pretrained(self.weights)
+        #self.embeddings = nn.Embedding(vocab_size, 512)
+        #self.embeddings.weight.requires_grad = False
+        self.lstm = nn.LSTM(300, 512, num_layers, batch_first = True, bidirectional = True)
+        self.fc = nn.Linear(1024, 512)  # 2 for bidirection
+        self.dropout = nn.Dropout(0.5)
+
+    def forward(self, x, text_lengths):
+        embedded = self.embeddings(x)
+        packed_embedded = pack_padded_sequence(embedded, text_lengths.to('cpu'), batch_first=True, enforce_sorted = False, ) # unpad
+        packed_output, (hidden, cell) = self.lstm(packed_embedded)
+        # packed_output shape = (batch, seq_len, num_directions * hidden_size)
+        # hidden shape  = (num_layers * num_directions, batch, hidden_size)
+
+        # concat the final forward and backward hidden state
+        cat = torch.cat((hidden[-2, :, :], hidden[-1, :, :]), dim=1)
+        # output, output_lengths = pad_packed_sequence(packed_output)  # pad the sequence to the max length in the batch
+
+        #rel = self.relu(cat)
+        dense1 = self.fc(cat)
+
+        drop = self.dropout(dense1)
+        #preds = self.fc2(drop)
+        out = F.normalize(drop, p=2, dim=1)
+        return out #shape?
+
+class VGG_Network(nn.Module):
+    def __init__(self):
+        super(VGG_Network, self).__init__()
+        self.backbone = backbone_.vgg16(pretrained=True).features
+        self.pool_method =  nn.AdaptiveMaxPool2d(1)
+        # self.down256 = nn.Linear(512, 256)
+
+    def forward(self, x, bb_box = None):
+        x = self.backbone(x)
+        x = self.pool_method(x).view(-1, 512)
+        # x = self.down256(x)
+        return F.normalize(x)
+
+
+# Quadrupletloss class
+class QuadrupletLoss(torch.nn.Module):
+    
+    def __init__(self, margin1=2.0, margin2=1.0):
+        super(QuadrupletLoss, self).__init__()
+        self.margin1 = margin1
+        self.margin2 = margin2
+
+    #def forward(self, anc_sketch, anc_text, positive, negative, pos1, neg1):
+    def forward(self, anc_sketch, anc_text, positive, negative):
+        sqr_dist_AS_pos = (anc_sketch - positive).pow(2).sum(1)
+        sqr_dist_AS_neg = (anc_sketch - negative).pow(2).sum(1)
+        sqr_dist_AT_pos = (anc_text - positive).pow(2).sum(1)
+        sqr_dist_AT_neg = (anc_text - positive).pow(2).sum(1)
+
+        #int1 = self.margin1 + sqr_dist_AS_pos - sqr_dist_AS_neg
+        #int2 = self.margin2 + sqr_dist_AT_pos - sqr_dist_AT_neg
+        quadruplet_loss = F.relu(self.margin1 + sqr_dist_AS_pos - sqr_dist_AS_neg) + F.relu(self.margin2 + sqr_dist_AT_pos - sqr_dist_AT_neg)
+
+        return quadruplet_loss.mean()
+        
+  class FGSBIR_Model(nn.Module):
+    def __init__(self, hp, vocab_size):
+        super(FGSBIR_Model, self).__init__()
+        
+        #self.sample_embedding_network = eval(hp.backbone_name + '_Network(hp)')
+        #self.text_embedding_network = eval(hp.backbone_text + '_Network(hp)'(vocab_size=vocab_size))
+        #self.sample_embedding_network = SketchTriplet_Network()
+        self.sample_embedding_network = VGG_Network()
+        self.text_embedding_network = BiLSTM_Network(vocab_size=vocab_size)
+        self.loss = QuadrupletLoss()
+        self.sample_train_params = list(self.sample_embedding_network.parameters()) + list(self.text_embedding_network.parameters())
+        
+        self.optimizer = optim.Adam(self.sample_train_params, hp.learning_rate)
+        
+        #self.shedular = lr_scheduler.ExponentialLR(self.optimizer, gamma=0.9)
+        self.hp = hp
+        self.layer = nn.Linear(512*2, 512)
+        self.activation = nn.ReLU()
+
+
+    def train_model(self, anc_sketch, text_tensor, word_length, img_tensor, neg_tensor):
+        self.train()
+        self.optimizer.zero_grad()
+        anc_sketch = anc_sketch.to(device)
+        text = text_tensor.to(device)
+        length = word_length.to(device)
+        image = img_tensor.to(device)
+        neg = neg_tensor.to(device)
+        sketch_feature = self.sample_embedding_network(anc_sketch)
+        positive_feature = self.sample_embedding_network(image)
+        negative_feature = self.sample_embedding_network(neg)
+        text_feature = self.text_embedding_network(text, length)
+        loss = self.loss(sketch_feature, text_feature, positive_feature, negative_feature)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return loss.item(), self.optimizer, 
+
+    def evaluate(self, datloader_Test):
+        Image_Feature_ALL = []
+        text_Feature_ALL = []
+        sketch_Feature_all = []
+        start_time = time.time()
+        self.eval()
+        for i_batch, sanpled_batch in enumerate(datloader_Test):
+            #print("text tensor", sanpled_batch[1])
+            anc_sketch, text_tensor, word_length, img_tensor, neg_tensor = sanpled_batch
+            #print("text tensor", text_tensor)
+            sketch = anc_sketch.to(device)
+            length = word_length.to(device)
+            image = img_tensor.to(device)
+            text = text_tensor.to(device)
+            text_feature, positive_feature, sketch_feature = self.test_forward(sketch, text, length, image)
+            query_feature = self.layer(torch.cat([sketch_feature, text_feature], dim=1))
+            print("query feature",query_feature.shape)
+            query_feature = self.activation(query_feature)
+            print("quer feature",query_feature.shape)
+            text_Feature_ALL.append(text_feature)
+            print("text feature all",text_feature.shape)
+            Image_Feature_ALL.append(positive_feature)
+            #print("Image feature all",Image_Feature_ALL[0])
+            sketch_Feature_all.append(sketch_feature)
+            print("sketch feature all",sketch_feature.shape)
+
+        text_Feature_ALL = torch.cat(text_Feature_ALL)
+        print("cat text feature all",text_Feature_ALL[0])
+        Image_Feature_ALL = torch.cat(Image_Feature_ALL)
+        print("cat Image feature all",Image_Feature_ALL[0] )
+        sketch_feature_all = torch.cat(sketch_Feature_all)
+        print("cat sketch feature all",sketch_Feature_all[0] )
+
+        
+        #query_feature = self.layer(torch.cat([sketch_feature, text_feature], dim=1))
+        #query_feature = self.layer(sketch_feature, text_feature)
+        #print("query feature",query_feature.shape)
+        #query_feature = self.activation(query_feature)
+        #print("quer feature",query_feature.shape)
+
+        rank = torch.zeros(len(query_feature))
+        for idx, query_feature in enumerate(text_Feature_ALL):
+            distance = F.pairwise_distance(query_feature.unsqueeze(0), Image_Feature_ALL)
+            target_distance = F.pairwise_distance(
+                query_feature.unsqueeze(0), Image_Feature_ALL[idx].unsqueeze(0))
+            rank[idx] = distance.le(target_distance).sum()
+        top1 = rank.le(1).sum().numpy() / rank.shape[0]
+        top5 = rank.le(5).sum().numpy() / rank.shape[0]
+        top10 = rank.le(10).sum().numpy() / rank.shape[0]
+
+        print('Time to Evaluate:{}'.format(time.time() - start_time))
+        return top1,top5,top10
+
+    def test_forward(self, sketch, text, length, image): #  this is being called only during evaluation
+        sketch_feature = self.sample_embedding_network(sketch)
+        positive_feature = self.sample_embedding_network(image)
+        
+        sample_feature = self.text_embedding_network(text, length)
+        print(sample_feature)
+        return sample_feature, positive_feature, sketch_feature
+        
+   def save_model(i_epoch, model, optimizer, top1_eval, top10_eval ):
+    """
+    Function to save the trained model to disk.
+    """
+    print(f"Saving final model...")
+    torch.save({
+                'epoch': i_epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'Top1_Acc': top1_eval,
+                'Top10_Acc': top10_eval
+                }, '/content/gdrive/MyDrive/Colab Notebooks/output/FGSBIR_final_model.pth')
+
+if __name__ == "__main__":
+    
+   
+    dataloader_Train, dataloader_Test, vocab_size = get_dataloader(hp)
+    print(f'train set: {len(dataloader_Train.dataset)}')
+    print(f'val set: {len(dataloader_Test.dataset)}')
+    
+    
+    model = FGSBIR_Model(hp, vocab_size=vocab_size)
+    model.to(device)
+
+    # model.load_state_dict(torch.load('VGG_ShoeV2_model_best.pth', map_location=device))
+    #log_dir = os.path.join(hp.out_dir + 'logs' )
+    #os.mkdir(log_dir) 
+    #writer = tb.SummaryWriter(log_dir)
+
+    step_count, top1, top10 = -1, 0, 0
+    for i_epoch in range(hp.max_epoch):
+        for batch_data in dataloader_Train:
+            anc_sketch, txt_tensor, word_length, img_tensor, neg_tensor = batch_data
+            step_count = step_count + 1
+            start = time.time()
+            model.train()
+            #loss, optimize = model.train_model(batch=batch_data)
+            loss, optimize = model.train_model(anc_sketch, txt_tensor, word_length, img_tensor, neg_tensor)
+
+            if step_count % hp.print_freq_iter == 0:
+                print('Epoch: {}, Iteration: {}, Loss: {:.5f}, Top1_Accuracy: {:.5f}, Top10_Accuracy: {:.5f}, Time: {}'.format
+                      (i_epoch, step_count, loss, top1, top10, time.time()-start))
+                #writer.add_scalar('train-loss', loss, step_count)
+                
+            if step_count % hp.eval_freq_iter == 0:
+                with torch.no_grad():
+                    top1_eval, top5_eval, top10_eval = model.evaluate(dataloader_Test)
+                    print('results : ', top1_eval, ' / ', top5_eval, ' / ', top10_eval)
+                    #writer.add_scalar('Accuracy/Top1', top1_eval,step_count)
+                    #writer.add_scalar('Accuracy/Top5', top5_eval,step_count)
+                    #writer.add_scalar('Accuracy/Top10', top10_eval,step_count)
+
+                if top1_eval > top1:
+                    torch.save(model.state_dict(), hp.backbone_name + '_' + hp.dataset_name + '_model_best.pth')
+                    save_model(i_epoch, model, optimize, top1_eval, top10_eval )
+                    top1, top10  = top1_eval, top10_eval
+                    print('Model Updated')
+
+    writer.close()
